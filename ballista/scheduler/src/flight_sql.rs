@@ -23,8 +23,9 @@ use arrow_flight::sql::{
     ActionCreatePreparedStatementResult, CommandGetCatalogs, CommandGetCrossReference,
     CommandGetDbSchemas, CommandGetExportedKeys, CommandGetImportedKeys,
     CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
-    CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementQuery,
-    CommandStatementUpdate, ProstAnyExt, SqlInfo, TicketStatementQuery,
+    CommandGetXdbcTypeInfo, CommandPreparedStatementQuery,
+    CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate,
+    SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::{
     Action, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
@@ -42,14 +43,13 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::scheduler_server::SchedulerServer;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::ProstMessageExt;
-use arrow_flight::utils::flight_data_from_arrow_batch;
+use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::SchemaAsIpc;
 use ballista_core::config::BallistaConfig;
 use ballista_core::serde::protobuf;
 use ballista_core::serde::protobuf::action::ActionType::FetchPartition;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::protobuf::JobStatus;
-use ballista_core::serde::protobuf::PhysicalPlanNode;
 use ballista_core::serde::protobuf::SuccessfulJob;
 use ballista_core::utils::create_grpc_client_connection;
 use dashmap::DashMap;
@@ -63,7 +63,7 @@ use datafusion::common::DFSchemaRef;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::common::batch_byte_size;
 use datafusion::prelude::SessionContext;
-use datafusion_proto::protobuf::LogicalPlanNode;
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use prost::Message;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::sleep;
@@ -89,6 +89,7 @@ impl FlightSqlServiceImpl {
         }
     }
 
+    #[allow(deprecated)]
     fn tables(&self, ctx: Arc<SessionContext>) -> Result<RecordBatch, ArrowError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("catalog_name", DataType::Utf8, true),
@@ -96,7 +97,7 @@ impl FlightSqlServiceImpl {
             Field::new("table_name", DataType::Utf8, false),
             Field::new("table_type", DataType::Utf8, false),
         ]));
-        let tables = ctx.tables()?;
+        let tables = ctx.tables()?; // resolved in #501
         let names: Vec<_> = tables.iter().map(|it| Some(it.as_str())).collect();
         let types: Vec<_> = names.iter().map(|_| Some("TABLE")).collect();
         let cats: Vec<_> = names.iter().map(|_| None).collect();
@@ -104,7 +105,7 @@ impl FlightSqlServiceImpl {
         let rb = RecordBatch::try_new(
             schema,
             [cats, schemas, names, types]
-                .into_iter()
+                .iter()
                 .map(|i| Arc::new(StringArray::from(i.clone())) as ArrayRef)
                 .collect::<Vec<_>>(),
         )?;
@@ -120,7 +121,7 @@ impl FlightSqlServiceImpl {
         RecordBatch::try_new(
             schema,
             [TABLE_TYPES]
-                .into_iter()
+                .iter()
                 .map(|i| Arc::new(StringArray::from(i.to_vec())) as ArrayRef)
                 .collect::<Vec<_>>(),
         )
@@ -130,7 +131,7 @@ impl FlightSqlServiceImpl {
         let config_builder = BallistaConfig::builder();
         let config = config_builder
             .build()
-            .map_err(|e| Status::internal(format!("Error building config: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Error building config: {e}")))?;
         let ctx = self
             .server
             .state
@@ -138,10 +139,10 @@ impl FlightSqlServiceImpl {
             .create_session(&config)
             .await
             .map_err(|e| {
-                Status::internal(format!("Failed to create SessionContext: {:?}", e))
+                Status::internal(format!("Failed to create SessionContext: {e:?}"))
             })?;
         let handle = Uuid::new_v4();
-        self.contexts.insert(handle.clone(), ctx);
+        self.contexts.insert(handle, ctx);
         Ok(handle)
     }
 
@@ -149,25 +150,24 @@ impl FlightSqlServiceImpl {
         let auth = req
             .metadata()
             .get("authorization")
-            .ok_or(Status::internal("No authorization header!"))?;
+            .ok_or_else(|| Status::internal("No authorization header!"))?;
         let str = auth
             .to_str()
-            .map_err(|e| Status::internal(format!("Error parsing header: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Error parsing header: {e}")))?;
         let authorization = str.to_string();
         let bearer = "Bearer ";
         if !authorization.starts_with(bearer) {
-            Err(Status::internal(format!("Invalid auth header!")))?;
+            Err(Status::internal("Invalid auth header!"))?;
         }
         let auth = authorization[bearer.len()..].to_string();
 
         let handle = Uuid::from_str(auth.as_str())
-            .map_err(|e| Status::internal(format!("Error locking contexts: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Error locking contexts: {e}")))?;
         if let Some(context) = self.contexts.get(&handle) {
             Ok(context.clone())
         } else {
             Err(Status::internal(format!(
-                "Context handle not found: {}",
-                handle
+                "Context handle not found: {handle}"
             )))?
         }
     }
@@ -179,8 +179,8 @@ impl FlightSqlServiceImpl {
         let plan = ctx
             .sql(query)
             .await
-            .and_then(|df| df.to_logical_plan())
-            .map_err(|e| Status::internal(format!("Error building plan: {}", e)))?;
+            .and_then(|df| df.into_optimized_plan())
+            .map_err(|e| Status::internal(format!("Error building plan: {e}")))?;
         Ok(plan)
     }
 
@@ -192,14 +192,14 @@ impl FlightSqlServiceImpl {
             .get_job_status(job_id)
             .await
             .map_err(|e| {
-                let msg = format!("Error getting status for job {}: {:?}", job_id, e);
+                let msg = format!("Error getting status for job {job_id}: {e:?}");
                 error!("{}", msg);
                 Status::internal(msg)
             })?;
         let status: JobStatus = match status {
             Some(status) => status,
             None => {
-                let msg = format!("Error getting status for job {}!", job_id);
+                let msg = format!("Error getting status for job {job_id}!");
                 error!("{}", msg);
                 Err(Status::internal(msg))?
             }
@@ -207,7 +207,7 @@ impl FlightSqlServiceImpl {
         let status: job_status::Status = match status.status {
             Some(status) => status,
             None => {
-                let msg = format!("Error getting status for job {}!", job_id);
+                let msg = format!("Error getting status for job {job_id}!");
                 error!("{}", msg);
                 Err(Status::internal(msg))?
             }
@@ -249,17 +249,17 @@ impl FlightSqlServiceImpl {
                 .advertise_flight_sql_endpoint
             {
                 Some(endpoint) => {
-                    let advertise_endpoint_vec: Vec<&str> = endpoint.split(":").collect();
+                    let advertise_endpoint_vec: Vec<&str> = endpoint.split(':').collect();
                     match advertise_endpoint_vec.as_slice() {
                         [host_ip, port] => {
-                            (String::from(*host_ip), FromStr::from_str(*port).expect("Failed to parse port from advertise-endpoint."))
+                            (String::from(*host_ip), FromStr::from_str(port).expect("Failed to parse port from advertise-endpoint."))
                         }
                         _ => {
                             Err(Status::internal("advertise-endpoint flag has incorrect format. Expected IP:Port".to_string()))?
                         }
                     }
                 }
-                None => (exec_host.clone(), exec_port.clone()),
+                None => (exec_host.clone(), exec_port),
             };
 
             let fetch = if let Some(ref id) = loc.partition_id {
@@ -287,10 +287,10 @@ impl FlightSqlServiceImpl {
             }
             let authority = format!("{}:{}", &host, &port);
             let loc = Location {
-                uri: format!("grpc+tcp://{}", authority),
+                uri: format!("grpc+tcp://{authority}"),
             };
             let buf = fetch.as_any().encode_to_vec();
-            let ticket = Ticket { ticket: buf };
+            let ticket = Ticket { ticket: buf.into() };
             let fiep = FlightEndpoint {
                 ticket: Some(ticket),
                 location: vec![loc],
@@ -316,10 +316,10 @@ impl FlightSqlServiceImpl {
         };
         let authority = format!("{}:{}", &host, &port); // TODO: use advertise host
         let loc = Location {
-            uri: format!("grpc+tcp://{}", authority),
+            uri: format!("grpc+tcp://{authority}"),
         };
         let buf = fetch.as_any().encode_to_vec();
-        let ticket = Ticket { ticket: buf };
+        let ticket = Ticket { ticket: buf.into() };
         let fiep = FlightEndpoint {
             ticket: Some(ticket),
             location: vec![loc],
@@ -339,8 +339,7 @@ impl FlightSqlServiceImpl {
             Ok(plan.clone())
         } else {
             Err(Status::internal(format!(
-                "Statement handle not found: {}",
-                handle
+                "Statement handle not found: {handle}"
             )))?
         }
     }
@@ -363,7 +362,7 @@ impl FlightSqlServiceImpl {
         let encoded_data = data_gen.schema_to_bytes(pair.0, pair.1);
         let mut schema_bytes = vec![];
         arrow::ipc::writer::write_message(&mut schema_bytes, encoded_data, pair.1)
-            .map_err(|e| Status::internal(format!("Error encoding schema: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Error encoding schema: {e}")))?;
         Ok(schema_bytes)
     }
 
@@ -373,13 +372,12 @@ impl FlightSqlServiceImpl {
         plan: &LogicalPlan,
     ) -> Result<String, Status> {
         let job_id = self.server.state.task_manager.generate_job_id();
-        let job_name = format!("Flight SQL job {}", job_id);
+        let job_name = format!("Flight SQL job {job_id}");
         self.server
             .submit_job(&job_id, &job_name, ctx, plan)
             .await
             .map_err(|e| {
-                let msg =
-                    format!("Failed to send JobQueued event for {}: {:?}", job_id, e);
+                let msg = format!("Failed to send JobQueued event for {job_id}: {e:?}");
                 error!("{}", msg);
                 Status::internal(msg)
             })?;
@@ -394,11 +392,11 @@ impl FlightSqlServiceImpl {
     ) -> Response<FlightInfo> {
         let flight_desc = FlightDescriptor {
             r#type: DescriptorType::Cmd.into(),
-            cmd: vec![],
+            cmd: Vec::new().into(),
             path: vec![],
         };
         let info = FlightInfo {
-            schema: schema_bytes,
+            schema: schema_bytes.into(),
             flight_descriptor: Some(flight_desc),
             endpoint: fieps,
             total_records: num_rows,
@@ -437,26 +435,20 @@ impl FlightSqlServiceImpl {
     }
 
     async fn record_batch_to_resp(
-        rb: &RecordBatch,
+        rb: RecordBatch,
     ) -> Result<
         Response<Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>>>,
         Status,
     > {
-        let (tx, rx): (
-            Sender<Result<FlightData, Status>>,
-            Receiver<Result<FlightData, Status>>,
-        ) = channel(2);
-        let options = IpcWriteOptions::default();
-        let schema = SchemaAsIpc::new(rb.schema().as_ref(), &options).into();
-        tx.send(Ok(schema))
-            .await
-            .map_err(|e| Status::internal("Error sending schema".to_string()))?;
-        let (dict, flight) = flight_data_from_arrow_batch(&rb, &options);
-        let flights = dict.into_iter().chain(std::iter::once(flight));
-        for flight in flights.into_iter() {
+        type FlightResult = Result<FlightData, Status>;
+        let (tx, rx): (Sender<FlightResult>, Receiver<FlightResult>) = channel(2);
+        let schema = (*rb.schema()).clone();
+        let flights = batches_to_flight_data(schema, vec![rb])
+            .map_err(|_| Status::internal("Error encoding batches".to_string()))?;
+        for flight in flights {
             tx.send(Ok(flight))
                 .await
-                .map_err(|e| Status::internal("Error sending flight".to_string()))?;
+                .map_err(|_| Status::internal("Error sending flight".to_string()))?;
         }
         let resp = Response::new(Box::pin(ReceiverStream::new(rx))
             as Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>);
@@ -468,7 +460,7 @@ impl FlightSqlServiceImpl {
         data: &RecordBatch,
         name: &str,
     ) -> Result<Response<FlightInfo>, Status> {
-        let num_bytes = batch_byte_size(&data) as i64;
+        let num_bytes = batch_byte_size(data) as i64;
         let schema = data.schema();
         let num_rows = data.num_rows() as i64;
 
@@ -499,13 +491,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let authorization = request
             .metadata()
             .get("authorization")
-            .ok_or(Status::invalid_argument("authorization field not present"))?
+            .ok_or_else(|| Status::invalid_argument("authorization field not present"))?
             .to_str()
             .map_err(|_| Status::invalid_argument("authorization not parsable"))?;
         if !authorization.starts_with(basic) {
             Err(Status::invalid_argument(format!(
-                "Auth type not implemented: {}",
-                authorization
+                "Auth type not implemented: {authorization}"
             )))?;
         }
         let base64 = &authorization[basic.len()..];
@@ -513,11 +504,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .map_err(|_| Status::invalid_argument("authorization not parsable"))?;
         let str = String::from_utf8(bytes)
             .map_err(|_| Status::invalid_argument("authorization not parsable"))?;
-        let parts: Vec<_> = str.split(":").collect();
+        let parts: Vec<_> = str.split(':').collect();
         if parts.len() != 2 {
-            Err(Status::invalid_argument(format!(
-                "Invalid authorization header"
-            )))?;
+            Err(Status::invalid_argument("Invalid authorization header"))?;
         }
         let user = parts[0];
         let pass = parts[1];
@@ -529,11 +518,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
 
         let result = HandshakeResponse {
             protocol_version: 0,
-            payload: token.as_bytes().to_vec(),
+            payload: token.as_bytes().to_vec().into(),
         };
         let result = Ok(result);
         let output = futures::stream::iter(vec![result]);
-        let str = format!("Bearer {}", token.to_string());
+        let str = format!("Bearer {token}");
         let mut resp: Response<Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>> =
             Response::new(Box::pin(output));
         let md = MetadataValue::try_from(str)
@@ -545,7 +534,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
     async fn do_get_fallback(
         &self,
         request: Request<Ticket>,
-        message: prost_types::Any,
+        message: arrow_flight::sql::Any,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         debug!("do_get_fallback type_url: {}", message.type_url);
         let ctx = self.get_ctx(&request)?;
@@ -558,8 +547,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
 
         let action: protobuf::Action = message
             .unpack()
-            .map_err(|e| Status::internal(format!("{:?}", e)))?
-            .ok_or(Status::internal("Expected an Action but got None!"))?;
+            .map_err(|e| Status::internal(format!("{e:?}")))?
+            .ok_or_else(|| Status::internal("Expected an Action but got None!"))?;
         let fp = match &action.action_type {
             Some(FetchPartition(fp)) => fp.clone(),
             None => Err(Status::internal("Expected an ActionType but got None!"))?,
@@ -569,18 +558,18 @@ impl FlightSqlService for FlightSqlServiceImpl {
         match fp.job_id.as_str() {
             "get_flight_info_table_types" => {
                 debug!("Responding with table types");
-                let rb = FlightSqlServiceImpl::table_types().map_err(|e| {
+                let rb = FlightSqlServiceImpl::table_types().map_err(|_| {
                     Status::internal("Error getting table types".to_string())
                 })?;
-                let resp = Self::record_batch_to_resp(&rb).await?;
+                let resp = Self::record_batch_to_resp(rb).await?;
                 return Ok(resp);
             }
             "get_flight_info_tables" => {
                 debug!("Responding with tables");
                 let rb = self
                     .tables(ctx)
-                    .map_err(|e| Status::internal("Error getting tables".to_string()))?;
-                let resp = Self::record_batch_to_resp(&rb).await?;
+                    .map_err(|_| Status::internal("Error getting tables".to_string()))?;
+                let resp = Self::record_batch_to_resp(rb).await?;
                 return Ok(resp);
             }
             _ => {}
@@ -594,20 +583,29 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 .await
                 .map_err(|e| {
                     Status::internal(format!(
-                        "Error connecting to Ballista scheduler or executor at {}: {:?}",
-                        addr, e
-                    ))
+                    "Error connecting to Ballista scheduler or executor at {addr}: {e:?}"
+                ))
                 })?;
         let mut flight_client = FlightServiceClient::new(connection);
         let buf = action.encode_to_vec();
-        let request = Request::new(Ticket { ticket: buf });
+        let request = Request::new(Ticket { ticket: buf.into() });
 
         let stream = flight_client
             .do_get(request)
             .await
-            .map_err(|e| Status::internal(format!("{:?}", e)))?
+            .map_err(|e| Status::internal(format!("{e:?}")))?
             .into_inner();
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    /// Get a FlightDataStream containing the data related to the supported XDBC types.
+    async fn do_get_xdbc_type_info(
+        &self,
+        _query: CommandGetXdbcTypeInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        debug!("do_get_xdbc_type_info");
+        Err(Status::unimplemented("Implement do_get_xdbc_type_info"))
     }
 
     async fn get_flight_info_statement(
@@ -632,8 +630,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> Result<Response<FlightInfo>, Status> {
         debug!("get_flight_info_prepared_statement");
         let ctx = self.get_ctx(&request)?;
-        let handle = Uuid::from_slice(handle.prepared_statement_handle.as_slice())
-            .map_err(|e| Status::internal(format!("Error decoding handle: {}", e)))?;
+        let handle = Uuid::from_slice(handle.prepared_statement_handle.as_ref())
+            .map_err(|e| Status::internal(format!("Error decoding handle: {e}")))?;
         let plan = self.get_plan(&handle)?;
         let resp = self.execute_plan(ctx, &plan).await?;
 
@@ -667,7 +665,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let ctx = self.get_ctx(&request)?;
         let data = self
             .tables(ctx)
-            .map_err(|e| Status::internal(format!("Error getting tables: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Error getting tables: {e}")))?;
         let resp = self.batch_to_schema_resp(&data, "get_flight_info_tables")?;
         Ok(resp)
     }
@@ -675,11 +673,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
     async fn get_flight_info_table_types(
         &self,
         _query: CommandGetTableTypes,
-        request: Request<FlightDescriptor>,
+        _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         debug!("get_flight_info_table_types");
         let data = FlightSqlServiceImpl::table_types()
-            .map_err(|e| Status::internal(format!("Error getting table types: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Error getting table types: {e}")))?;
         let resp = self.batch_to_schema_resp(&data, "get_flight_info_table_types")?;
         Ok(resp)
     }
@@ -731,6 +729,18 @@ impl FlightSqlService for FlightSqlServiceImpl {
         debug!("get_flight_info_cross_reference");
         Err(Status::unimplemented(
             "Implement get_flight_info_cross_reference",
+        ))
+    }
+
+    /// Get a FlightInfo to extract information about the supported XDBC types.
+    async fn get_flight_info_xdbc_type_info(
+        &self,
+        _query: CommandGetXdbcTypeInfo,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        debug!("get_flight_info_xdbc_type_info");
+        Err(Status::unimplemented(
+            "Implement get_flight_info_xdbc_type_info",
         ))
     }
 
@@ -854,8 +864,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> Result<i64, Status> {
         debug!("do_put_prepared_statement_update");
         let ctx = self.get_ctx(&request)?;
-        let handle = Uuid::from_slice(handle.prepared_statement_handle.as_slice())
-            .map_err(|e| Status::internal(format!("Error decoding handle: {}", e)))?;
+        let handle = Uuid::from_slice(handle.prepared_statement_handle.as_ref())
+            .map_err(|e| Status::internal(format!("Error decoding handle: {e}")))?;
         let plan = self.get_plan(&handle)?;
         let _ = self.execute_plan(ctx, &plan).await?;
         debug!("Sending -1 rows affected");
@@ -874,9 +884,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let handle = self.cache_plan(plan)?;
         debug!("Prepared statement {}:\n{}", handle, query.query);
         let res = ActionCreatePreparedStatementResult {
-            prepared_statement_handle: handle.as_bytes().to_vec(),
-            dataset_schema: schema_bytes,
-            parameter_schema: vec![], // TODO: parameters
+            prepared_statement_handle: handle.as_bytes().to_vec().into(),
+            dataset_schema: schema_bytes.into(),
+            parameter_schema: Vec::new().into(), // TODO: parameters
         };
         Ok(res)
     }
@@ -887,7 +897,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         _request: Request<Action>,
     ) {
         debug!("do_action_close_prepared_statement");
-        let handle = Uuid::from_slice(handle.prepared_statement_handle.as_slice());
+        let handle = Uuid::from_slice(handle.prepared_statement_handle.as_ref());
         let handle = if let Ok(handle) = handle {
             debug!("Closing {}", handle);
             handle

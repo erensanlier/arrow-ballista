@@ -24,13 +24,15 @@ use crate::serde::scheduler::PartitionStats;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::{ipc::writer::FileWriter, record_batch::RecordBatch};
-use datafusion::datasource::object_store::{ObjectStoreProvider, ObjectStoreRegistry};
+use datafusion::datasource::object_store::{
+    DefaultObjectStoreRegistry, ObjectStoreRegistry,
+};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{
     QueryPlanner, SessionConfig, SessionContext, SessionState,
 };
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -52,6 +54,8 @@ use futures::StreamExt;
 use log::error;
 #[cfg(feature = "s3")]
 use object_store::aws::AmazonS3Builder;
+#[cfg(feature = "azure")]
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::ObjectStore;
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
@@ -76,43 +80,96 @@ pub fn default_session_builder(config: SessionConfig) -> SessionState {
 
 /// Get a RuntimeConfig with specific ObjectStoreDetector in the ObjectStoreRegistry
 pub fn with_object_store_provider(config: RuntimeConfig) -> RuntimeConfig {
-    config.with_object_store_registry(Arc::new(ObjectStoreRegistry::new_with_provider(
-        Some(Arc::new(FeatureBasedObjectStoreProvider)),
-    )))
+    let object_store_registry = BallistaObjectStoreRegistry::new();
+    config.with_object_store_registry(Arc::new(object_store_registry))
 }
 
 /// An object store detector based on which features are enable for different kinds of object stores
-pub struct FeatureBasedObjectStoreProvider;
+#[derive(Debug, Default)]
+pub struct BallistaObjectStoreRegistry {
+    inner: DefaultObjectStoreRegistry,
+}
 
-impl ObjectStoreProvider for FeatureBasedObjectStoreProvider {
-    /// Detector a suitable object store based on its url if possible
-    /// Return the key and object store
-    #[allow(unused_variables)]
-    fn get_by_url(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+impl BallistaObjectStoreRegistry {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Find a suitable object store based on its url and enabled features if possible
+    fn get_feature_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         #[cfg(any(feature = "hdfs", feature = "hdfs3"))]
         {
-            let store = HadoopFileSystem::new(url.as_str());
-            if let Some(store) = store {
+            if let Some(store) = HadoopFileSystem::new(url.as_str()) {
                 return Ok(Arc::new(store));
             }
         }
 
         #[cfg(feature = "s3")]
         {
-            if url.to_string().starts_with("s3://") {
+            if url.as_str().starts_with("s3://") {
                 if let Some(bucket_name) = url.host_str() {
-                    let store = AmazonS3Builder::from_env()
-                        .with_bucket_name(bucket_name)
-                        .build()?;
-                    return Ok(Arc::new(store));
+                    let store = Arc::new(
+                        AmazonS3Builder::from_env()
+                            .with_bucket_name(bucket_name)
+                            .build()?,
+                    );
+                    return Ok(store);
+                }
+            // Support Alibaba Cloud OSS
+            // Use S3 compatibility mode to access Alibaba Cloud OSS
+            // The `AWS_ENDPOINT` should have bucket name included
+            } else if url.as_str().starts_with("oss://") {
+                if let Some(bucket_name) = url.host_str() {
+                    let store = Arc::new(
+                        AmazonS3Builder::from_env()
+                            .with_virtual_hosted_style_request(true)
+                            .with_bucket_name(bucket_name)
+                            .build()?,
+                    );
+                    return Ok(store);
+                }
+            }
+        }
+
+        #[cfg(feature = "azure")]
+        {
+            if url.to_string().starts_with("azure://") {
+                if let Some(bucket_name) = url.host_str() {
+                    let store = Arc::new(
+                        MicrosoftAzureBuilder::from_env()
+                            .with_container_name(bucket_name)
+                            .build()?,
+                    );
+                    return Ok(store);
                 }
             }
         }
 
         Err(DataFusionError::Execution(format!(
-            "No object store available for {}",
-            url
+            "No object store available for: {url}"
         )))
+    }
+}
+
+impl ObjectStoreRegistry for BallistaObjectStoreRegistry {
+    fn register_store(
+        &self,
+        url: &Url,
+        store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        self.inner.register_store(url, store)
+    }
+
+    fn get_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        self.inner.get_store(url).or_else(|_| {
+            let store = self.get_feature_store(url)?;
+            self.inner.register_store(url, store.clone());
+
+            Ok(store)
+        })
     }
 }
 
@@ -242,7 +299,7 @@ fn build_exec_plan_diagram(
     {
         "CoalescePartitionsExec"
     } else {
-        println!("Unknown: {:?}", plan);
+        println!("Unknown: {plan:?}");
         "Unknown"
     };
 
@@ -252,8 +309,7 @@ fn build_exec_plan_diagram(
     if draw_entity {
         writeln!(
             w,
-            "\t\tstage_{}_exec_{} [shape=box, label=\"{}\"];",
-            stage_id, node_id, operator_str
+            "\t\tstage_{stage_id}_exec_{node_id} [shape=box, label=\"{operator_str}\"];"
         )?;
     }
     for child in plan.children() {
@@ -272,8 +328,7 @@ fn build_exec_plan_diagram(
             if draw_entity {
                 writeln!(
                     w,
-                    "\t\tstage_{}_exec_{} -> stage_{}_exec_{};",
-                    stage_id, child_id, stage_id, node_id
+                    "\t\tstage_{stage_id}_exec_{child_id} -> stage_{stage_id}_exec_{node_id};"
                 )?;
             }
         }
@@ -302,7 +357,7 @@ pub fn create_df_ctx_with_ballista_query_planner<T: 'static + AsLogicalPlan>(
         ),
     )
     .with_query_planner(planner);
-    session_state.session_id = session_id;
+    session_state = session_state.with_session_id(session_id);
     // the SessionContext created here is the client side context, but the session_id is from server side.
     SessionContext::with_state(session_state)
 }
@@ -360,7 +415,7 @@ impl<T: 'static + AsLogicalPlan> QueryPlanner for BallistaQueryPlanner<T> {
         session_state: &SessionState,
     ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         match logical_plan {
-            LogicalPlan::CreateExternalTable(_) => {
+            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(_)) => {
                 // table state is managed locally in the BallistaContext, not in the scheduler
                 Ok(Arc::new(EmptyExec::new(false, Arc::new(Schema::empty()))))
             }
@@ -370,7 +425,7 @@ impl<T: 'static + AsLogicalPlan> QueryPlanner for BallistaQueryPlanner<T> {
                 logical_plan.clone(),
                 self.extension_codec.clone(),
                 self.plan_repr,
-                session_state.session_id.clone(),
+                session_state.session_id().to_string(),
             ))),
         }
     }
