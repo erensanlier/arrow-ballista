@@ -160,7 +160,7 @@ jobs:
       - run: |
           set -x
           export DOCKER_TAG=$(cat /root/project/docker-tag.txt)
-          apt-get update && apt-get install -y curl
+          apt-get update && apt-get install -y curl unzip
           curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
           ./aws/install
@@ -197,36 +197,6 @@ jobs:
             --set image.repository=694710077702.dkr.ecr.us-east-1.amazonaws.com/sxt-central/ \
             --set minio.auth.rootPassword="$MINIO_PASSWORD"
 
-  seed_data:
-    docker:
-      - image: docker:24.0.4-git
-    steps:
-      - attach_workspace:
-          at: /root
-      - run: |
-          set -x
-          apk add netcat-openbsd
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-          docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION public.ecr.aws/aws-cli/aws-cli eks update-kubeconfig --region $AWS_REGION --name sxt
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x mc
-          mv mc /usr/local/bin/mc
-          if [ $CIRCLE_BRANCH = "master" ]
-          then
-            export NAMESPACE="default"
-          else
-            export NAMESPACE=$(echo "$CIRCLE_BRANCH" | sed -r 's/[_]+/-/g')
-          fi
-          kubectl port-forward --namespace $NAMESPACE service/ballista-minio 9000:9000 9001:9001 &
-          while ! nc -vz 127.0.0.1 9000 > /dev/null 2>&1 ; do
-            sleep 3
-          done          
-          mc alias set myminio http://127.0.0.1:9000 minio "$MINIO_PASSWORD"
-          mc mb --ignore-existing myminio/tpch
-          mc cp --quiet --no-color --debug --recursive /root/project/delta/* /root/project/parquet/* /root/project/csv/* myminio/tpch
-          mc ls myminio/tpch
-
 workflows:
   main_workflow:
     jobs:
@@ -248,7 +218,3 @@ workflows:
       - deploy_helm:
           requires:
             - deploy_docker
-      - seed_data:
-          requires:
-            - convert_data
-            - deploy_helm
