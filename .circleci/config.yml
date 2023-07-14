@@ -153,7 +153,7 @@ jobs:
 
   deploy_helm:
     docker:
-      - image: amazon/aws-cli
+      - image: docker:24.0.4-git
     steps:
       - attach_workspace:
           at: /root
@@ -163,7 +163,7 @@ jobs:
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
           cd /root/project/helm/ballista
-          aws eks update-kubeconfig --region $AWS_REGION --name sxt
+          docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION public.ecr.aws/aws-cli/aws-cli eks update-kubeconfig --name sxt
           curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           if [ $CIRCLE_BRANCH = "master" ]
           then
@@ -173,7 +173,7 @@ jobs:
           fi
           export ECR_SERVER="https://694710077702.dkr.ecr.us-east-1.amazonaws.com/sxt-central"
           export ECR_USER="AWS"
-          export ECR_PASS=$(aws ecr get-login-password --region us-east-1)
+          export ECR_PASS=$(docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY public.ecr.aws/aws-cli/aws-cli ecr get-login-password --region us-east-1)
           kubectl create namespace $NAMESPACE || true
           kubectl config set-context --current --namespace=$NAMESPACE
           kubectl delete secret --ignore-not-found=true regcred
@@ -195,7 +195,7 @@ jobs:
 
   seed_data:
     docker:
-      - image: amazon/aws-cli
+      - image: docker:24.0.4-git
     steps:
       - attach_workspace:
           at: /root
@@ -204,10 +204,7 @@ jobs:
           apk add netcat-openbsd
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
-          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
-          aws configure set region $AWS_REGION
-          aws eks update-kubeconfig --region $AWS_REGION --name sxt
+          docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION public.ecr.aws/aws-cli/aws-cli eks update-kubeconfig --region $AWS_REGION --name sxt
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           mv mc /usr/local/bin/mc
