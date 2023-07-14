@@ -77,7 +77,9 @@ jobs:
           export DOCKER_TAG=$(cat /root/project/docker-tag.txt)
           docker build -f dev/docker/ballista-scheduler.Dockerfile . -t 694710077702.dkr.ecr.us-east-1.amazonaws.com/ballista-scheduler:$DOCKER_TAG
           docker build -f dev/docker/ballista-executor.Dockerfile . -t 694710077702.dkr.ecr.us-east-1.amazonaws.com/ballista-executor:$DOCKER_TAG
-          docker run --rm -it public.ecr.aws/aws-cli/aws-cli ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 694710077702.dkr.ecr.us-east-1.amazonaws.com
+          export ECR_PASS=$(docker run --rm -it public.ecr.aws/aws-cli/aws-cli ecr get-login-password --region us-east-1)
+          echo $ECR_PASS
+          echo $ECR_PASS | docker login --username AWS --password-stdin 694710077702.dkr.ecr.us-east-1.amazonaws.com
           docker push 694710077702.dkr.ecr.us-east-1.amazonaws.com/ballista-scheduler:$DOCKER_TAG
           docker push 694710077702.dkr.ecr.us-east-1.amazonaws.com/ballista-executor:$DOCKER_TAG
 
