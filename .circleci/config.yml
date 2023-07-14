@@ -153,7 +153,7 @@ jobs:
 
   deploy_helm:
     docker:
-      - image: docker:24.0.4-git
+      - image: ubuntu:22.04
     steps:
       - attach_workspace:
           at: /root
@@ -161,10 +161,13 @@ jobs:
           set -x
           export DOCKER_TAG=$(cat /root/project/docker-tag.txt)
           apt-get update && apt-get install -y curl
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
           cd /root/project/helm/ballista
-          docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION public.ecr.aws/aws-cli/aws-cli eks update-kubeconfig --name sxt
+          aws eks update-kubeconfig --name sxt
           curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           if [ $CIRCLE_BRANCH = "master" ]
           then
