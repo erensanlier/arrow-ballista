@@ -194,7 +194,7 @@ jobs:
             --set image.executor=ballista-executor \
             --set image.tag=$DOCKER_TAG \
             --set image.pullPolicy=IfNotPresent \
-            --set image.repository=694710077702.dkr.ecr.us-east-1.amazonaws.com \
+            --set image.repository=694710077702.dkr.ecr.us-east-1.amazonaws.com/ \
             --set minio.auth.rootPassword="$MINIO_PASSWORD"
 
   seed_data:
