@@ -175,7 +175,7 @@ jobs:
           else
             export NAMESPACE=$(echo "$CIRCLE_BRANCH" | sed -r 's/[_]+/-/g')
           fi
-          export ECR_SERVER="https://694710077702.dkr.ecr.us-east-1.amazonaws.com/sxt-central"
+          export ECR_SERVER="https://694710077702.dkr.ecr.us-east-1.amazonaws.com"
           export ECR_USER="AWS"
           export ECR_PASS=$(aws ecr get-login-password --region us-east-1)
           kubectl create namespace $NAMESPACE || true
@@ -194,21 +194,24 @@ jobs:
             --set image.executor=ballista-executor \
             --set image.tag=$DOCKER_TAG \
             --set image.pullPolicy=IfNotPresent \
-            --set image.repository=694710077702.dkr.ecr.us-east-1.amazonaws.com/sxt-central/ \
+            --set image.repository=694710077702.dkr.ecr.us-east-1.amazonaws.com \
             --set minio.auth.rootPassword="$MINIO_PASSWORD"
 
   seed_data:
     docker:
-      - image: docker:24.0.4-git
+      - image: alpine:latest
     steps:
       - attach_workspace:
           at: /root
       - run: |
           set -x
           apk add netcat-openbsd
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-          docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION public.ecr.aws/aws-cli/aws-cli eks update-kubeconfig --region $AWS_REGION --name sxt
+          aws eks update-kubeconfig --region $AWS_REGION --name sxt
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           mv mc /usr/local/bin/mc
