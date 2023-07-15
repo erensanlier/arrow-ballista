@@ -160,8 +160,8 @@ jobs:
       - run: |
           set -x
           export DOCKER_TAG=$(cat /root/project/docker-tag.txt)
-          apt-get update && apt-get install -y curl
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"
+          apt-get update && apt-get install -y curl unzip
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
           ./aws/install
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -177,7 +177,7 @@ jobs:
           fi
           export ECR_SERVER="https://694710077702.dkr.ecr.us-east-1.amazonaws.com/sxt-central"
           export ECR_USER="AWS"
-          export ECR_PASS=$(docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY public.ecr.aws/aws-cli/aws-cli ecr get-login-password --region us-east-1)
+          export ECR_PASS=$(aws ecr get-login-password --region us-east-1)
           kubectl create namespace $NAMESPACE || true
           kubectl config set-context --current --namespace=$NAMESPACE
           kubectl delete secret --ignore-not-found=true regcred
