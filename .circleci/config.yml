@@ -199,13 +199,14 @@ jobs:
 
   seed_data:
     docker:
-      - image: alpine:latest
+      - image: ubuntu:22.04
     steps:
       - attach_workspace:
           at: /root
       - run: |
           set -x
-          apk add netcat-openbsd wget curl unzip
+          apt-get update
+          apt-get install -y netcat-openbsd wget curl unzip
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
           ./aws/install
