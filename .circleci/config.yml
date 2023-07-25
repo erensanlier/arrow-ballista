@@ -195,7 +195,10 @@ jobs:
             --set image.tag=$DOCKER_TAG \
             --set image.pullPolicy=IfNotPresent \
             --set image.repository=694710077702.dkr.ecr.us-east-1.amazonaws.com/ \
-            --set minio.auth.rootPassword="$MINIO_PASSWORD"
+            --set minio.auth.rootUser="$AWS_ACCESS_KEY_ID" \
+            --set minio.auth.rootPassword="$AWS_SECRET_ACCESS_KEY" \
+            --set config.s3.region="$AWS_REGION" \
+            --set config.s3.endpoint=http://s3.us-east-1.amazonaws.com
 
   seed_data:
     docker:
