@@ -34,7 +34,7 @@ jobs:
       - checkout
       - run: |
           apt-get update
-          apt-get -y install libssl-dev openssl zlib1g zlib1g-dev libpq-dev cmake protobuf-compiler netcat curl unzip git build-essential
+          apt-get -y install pkg-config libssl-dev openssl zlib1g zlib1g-dev libpq-dev cmake protobuf-compiler netcat curl unzip git build-essential
           export DOCKER_TAG=$(cat /root/project/docker-tag.txt)
           curl https://sh.rustup.rs -sSf | sh -s -- -y
           export PATH=/root/.cargo/bin:$PATH
